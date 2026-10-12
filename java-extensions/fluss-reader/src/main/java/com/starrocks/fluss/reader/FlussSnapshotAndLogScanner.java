@@ -15,7 +15,8 @@
 package com.starrocks.fluss.reader;
 
 import org.apache.fluss.client.table.Table;
-import org.apache.fluss.flink.lake.reader.LakeSnapshotAndLogSplitScanner;
+import org.apache.fluss.client.table.scanner.batch.BatchScanner;
+import org.apache.fluss.client.table.scanner.batch.LakeSnapshotAndLogSplitScanner;
 import org.apache.fluss.flink.lake.split.LakeSnapshotAndFlussLogSplit;
 import org.apache.fluss.lake.source.LakeSource;
 import org.apache.fluss.lake.source.LakeSplit;
@@ -34,7 +35,7 @@ public class FlussSnapshotAndLogScanner extends ConnectorScannerProxy {
     private final LakeSnapshotAndFlussLogSplit split;
     @Nullable
     private final int[] projectedFields;
-    private LakeSnapshotAndLogSplitScanner batchScanner;
+    private BatchScanner batchScanner;
     private CloseableIterator<InternalRow> currentBatch;
     private boolean finished = false;
 
@@ -49,7 +50,18 @@ public class FlussSnapshotAndLogScanner extends ConnectorScannerProxy {
 
     @Override
     void open() throws IOException {
-        batchScanner = new LakeSnapshotAndLogSplitScanner(table, lakeSource, split, projectedFields);
+        // Fluss 1.0.0 moved the bounded snapshot+log reader to
+        // client.table.scanner.batch and dropped the single-split constructor;
+        // feed it the split's lake splits plus the log offset range, mirroring
+        // the bounded branch of Fluss's own LakeSplitReaderGenerator.
+        if (split.isStreaming()) {
+            throw new IOException("Streaming lake+log splits are not supported by the StarRocks Fluss reader: " + split);
+        }
+        long stoppingOffset = split.getStoppingOffset().orElseThrow(
+                () -> new IOException("Bounded lake+log split is missing a stopping offset: " + split));
+        batchScanner = new LakeSnapshotAndLogSplitScanner(
+                table, lakeSource, split.getLakeSplits(), split.getTableBucket(),
+                split.getStartingOffset(), stoppingOffset, projectedFields);
     }
 
     @Override
