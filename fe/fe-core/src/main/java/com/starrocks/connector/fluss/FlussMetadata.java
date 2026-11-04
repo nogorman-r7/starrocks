@@ -22,6 +22,8 @@ import com.starrocks.catalog.FlussTable;
 import com.starrocks.catalog.PartitionKey;
 import com.starrocks.catalog.Table;
 import com.starrocks.common.Config;
+import com.starrocks.common.profile.Timer;
+import com.starrocks.common.profile.Tracers;
 import com.starrocks.common.tvr.TvrVersionRange;
 import com.starrocks.common.util.TimeUtils;
 import com.starrocks.common.util.concurrent.lock.BlockingCallValidator;
@@ -76,6 +78,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
+import static com.starrocks.common.profile.Tracers.Module.EXTERNAL;
 import static com.starrocks.connector.ConnectorTableId.CONNECTOR_ID_GENERATOR;
 import static com.starrocks.connector.PartitionUtil.toHivePartitionName;
 import static org.apache.fluss.flink.utils.CatalogExceptionUtils.isDatabaseNotExist;
@@ -326,8 +329,12 @@ public class FlussMetadata implements ConnectorMetadata {
         // above (no selected partitions) reach neither.
         BlockingCallValidator.validateNotUnderLock("fluss", catalogName);
         List<Predicate> lakePredicates = Lists.newArrayList();
-        LakeSource<LakeSplit> lakeSource =
-                createLakeSource(flussTable.getTableInfo().getTablePath(), flussTable.buildRuntimeConf().toMap());
+        String tracePrefix = flussTable.getCatalogTableName() + ".";
+        LakeSource<LakeSplit> lakeSource;
+        try (Timer ignored = Tracers.watchScope(EXTERNAL, tracePrefix + "createLakeSource")) {
+            lakeSource = createLakeSource(
+                    flussTable.getTableInfo().getTablePath(), flussTable.buildRuntimeConf().toMap());
+        }
         try {
             lakePredicates = convertLakePredicates(flussTable, params.getPredicate());
             if (!lakePredicates.isEmpty()) {
@@ -361,7 +368,7 @@ public class FlussMetadata implements ConnectorMetadata {
                 tableInfo, admin,
                 lakeSource, bucketOffsetsRetriever,
                 new LatestOffsetsInitializer(), tableInfo.getNumBuckets(), listPartitionSupplier);
-        try {
+        try (Timer ignored = Tracers.watchScope(EXTERNAL, tracePrefix + "generateHybridLakeFlussSplits")) {
             splits = lakeSplitGenerator.generateHybridLakeFlussSplits();
         } catch (Exception e) {
             LOG.error("Failed to get Fluss splits for table {}.{}.{}.",
