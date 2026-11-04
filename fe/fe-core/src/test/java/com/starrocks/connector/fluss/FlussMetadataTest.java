@@ -261,6 +261,7 @@ public class FlussMetadataTest {
                     () -> metadata.getRemoteFiles(table, GetRemoteFilesParams.newBuilder().build()));
             String timers = Tracers.printScopeTimer();
             Assertions.assertTrue(timers.contains(TABLE + ".createLakeSource"), timers);
+            Assertions.assertTrue(timers.contains(TABLE + ".pushDownLakePredicates"), timers);
             Assertions.assertTrue(timers.contains(TABLE + ".generateHybridLakeFlussSplits"), timers);
         } finally {
             Tracers.close();

@@ -81,6 +81,8 @@ import java.util.stream.Collectors;
 import static com.starrocks.common.profile.Tracers.Module.EXTERNAL;
 import static com.starrocks.connector.ConnectorTableId.CONNECTOR_ID_GENERATOR;
 import static com.starrocks.connector.PartitionUtil.toHivePartitionName;
+import static com.starrocks.connector.fluss.FlussSplitPlanningTracing.traceBucketOffsets;
+import static com.starrocks.connector.fluss.FlussSplitPlanningTracing.traceLakePlanning;
 import static org.apache.fluss.flink.utils.CatalogExceptionUtils.isDatabaseNotExist;
 import static org.apache.fluss.flink.utils.CatalogExceptionUtils.isTableNotExist;
 import static org.apache.fluss.flink.utils.CatalogExceptionUtils.isTableNotPartitioned;
@@ -321,21 +323,20 @@ public class FlussMetadata implements ConnectorMetadata {
 
         TablePath identifier = TablePath.of(flussTable.getCatalogDBName(), flussTable.getCatalogTableName());
 
-        OffsetsInitializer.BucketOffsetsRetriever bucketOffsetsRetriever =
-                new BucketOffsetsRetrieverImpl(admin, identifier);
-
         // From here on split planning is remote on both sides: the lake source reads the Paimon
         // snapshot, and LakeSplitGenerator asks the coordinator for bucket offsets. The early returns
         // above (no selected partitions) reach neither.
         BlockingCallValidator.validateNotUnderLock("fluss", catalogName);
         List<Predicate> lakePredicates = Lists.newArrayList();
         String tracePrefix = flussTable.getCatalogTableName() + ".";
+        OffsetsInitializer.BucketOffsetsRetriever bucketOffsetsRetriever =
+                traceBucketOffsets(new BucketOffsetsRetrieverImpl(admin, identifier), tracePrefix);
         LakeSource<LakeSplit> lakeSource;
         try (Timer ignored = Tracers.watchScope(EXTERNAL, tracePrefix + "createLakeSource")) {
-            lakeSource = createLakeSource(
-                    flussTable.getTableInfo().getTablePath(), flussTable.buildRuntimeConf().toMap());
+            lakeSource = traceLakePlanning(createLakeSource(
+                    flussTable.getTableInfo().getTablePath(), flussTable.buildRuntimeConf().toMap()), tracePrefix);
         }
-        try {
+        try (Timer ignored = Tracers.watchScope(EXTERNAL, tracePrefix + "pushDownLakePredicates")) {
             lakePredicates = convertLakePredicates(flussTable, params.getPredicate());
             if (!lakePredicates.isEmpty()) {
                 lakeSource.withFilters(lakePredicates);
