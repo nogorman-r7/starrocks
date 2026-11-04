@@ -38,6 +38,7 @@ import com.starrocks.connector.RemoteFileInfo;
 import com.starrocks.connector.exception.StarRocksConnectorException;
 import com.starrocks.credential.CloudConfiguration;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.qe.SessionVariable;
 import com.starrocks.sql.optimizer.OptimizerContext;
 import com.starrocks.sql.optimizer.Utils;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
@@ -68,11 +69,13 @@ import org.apache.logging.log4j.Logger;
 
 import java.time.ZoneId;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
@@ -108,11 +111,19 @@ public class FlussMetadata implements ConnectorMetadata {
     // Catalog-level Fluss/lake options copied from CREATE EXTERNAL CATALOG.
     private final Configuration catalogConf;
 
+    private final FlussSplitPlanCache splitPlanCache;
+
     public FlussMetadata(String catalogName, HdfsEnvironment hdfsEnvironment, Admin admin, Configuration catalogConf) {
+        this(catalogName, hdfsEnvironment, admin, catalogConf, new FlussSplitPlanCache());
+    }
+
+    FlussMetadata(String catalogName, HdfsEnvironment hdfsEnvironment, Admin admin, Configuration catalogConf,
+                  FlussSplitPlanCache splitPlanCache) {
         this.catalogName = catalogName;
         this.hdfsEnvironment = hdfsEnvironment;
         this.admin = admin;
         this.catalogConf = catalogConf;
+        this.splitPlanCache = splitPlanCache;
     }
 
     @Override
@@ -327,8 +338,67 @@ public class FlussMetadata implements ConnectorMetadata {
         // snapshot, and LakeSplitGenerator asks the coordinator for bucket offsets. The early returns
         // above (no selected partitions) reach neither.
         BlockingCallValidator.validateNotUnderLock("fluss", catalogName);
-        List<Predicate> lakePredicates = Lists.newArrayList();
         String tracePrefix = flussTable.getCatalogTableName() + ".";
+        List<Predicate> lakePredicates;
+        try (Timer ignored = Tracers.watchScope(EXTERNAL, tracePrefix + "convertLakePredicates")) {
+            lakePredicates = convertLakePredicates(flussTable, params.getPredicate());
+        } catch (Exception e) {
+            LOG.warn("Failed to convert predicates for lake source of table {}, " +
+                    "falling back to scan without filter pushdown", identifier, e);
+            lakePredicates = Lists.newArrayList();
+        }
+
+        Set<String> selectedQualifiedPartitionNames = flussTable.isUnPartitioned() ? Collections.emptySet() :
+                selectedPartitionKeys.stream()
+                        .filter(Objects::nonNull)
+                        .map(partitionKey -> toHivePartitionName(flussTable.getPartitionColumnNames(), partitionKey))
+                        .collect(Collectors.toCollection(LinkedHashSet::new));
+
+        SessionVariable sessionVariable =
+                ConnectContext.get() == null ? null : ConnectContext.get().getSessionVariable();
+        long splitPlanCacheTtlMs = sessionVariable != null && sessionVariable.isEnableFlussSplitPlanCache()
+                ? sessionVariable.getFlussSplitPlanCacheTtlMs() : 0;
+        FlussSplitPlanCache.Key splitPlanKey = splitPlanCacheTtlMs > 0
+                ? FlussSplitPlanCache.key(tableInfo.getTableId(), identifier, selectedQualifiedPartitionNames,
+                        lakePredicates)
+                : null;
+        List<SourceSplitBase> splits =
+                splitPlanKey == null ? null : splitPlanCache.getIfFresh(splitPlanKey, splitPlanCacheTtlMs);
+        if (splitPlanKey != null) {
+            Tracers.record(EXTERNAL, "Fluss.scan." + tracePrefix + "splitPlanCache", splits == null ? "MISS" : "HIT");
+        }
+        if (splits == null) {
+            int predicateCount = lakePredicates.size();
+            splits = generateSplits(flussTable, identifier, lakePredicates, selectedQualifiedPartitionNames,
+                    tracePrefix);
+            // A failed filter pushdown empties lakePredicates; those splits must not be served for the filtered key.
+            if (splitPlanKey != null && lakePredicates.size() == predicateCount) {
+                splitPlanCache.put(splitPlanKey, splits);
+            }
+        }
+        if (flussTable.getTableNameSuffix().equals(LAKE_TABLE_SUFFIX)) {
+            splits = splits.stream().filter(SourceSplitBase::isLakeSplit)
+                    .collect(Collectors.toList());
+        }
+        if (flussTable.getTableNameSuffix().equals(RT_TABLE_SUFFIX)) {
+            splits = splits.stream().filter(sp -> sp instanceof LogSplit)
+                    .collect(Collectors.toList());
+        }
+        if (sessionVariable != null && sessionVariable.isEnableFlussBucketPruning()) {
+            splits = pruneBuckets(flussTable, lakePredicates, splits, sessionVariable.isFlussBucketPruningShadowMode());
+        }
+
+        FlussSplitsInfo flussSplitsInfo = new FlussSplitsInfo(lakePredicates, splits);
+        List<RemoteFileDesc> remoteFileDescs = ImmutableList.of(
+                FlussRemoteFileDesc.createFlussRemoteFileDesc(flussSplitsInfo));
+        remoteFileInfo.setFiles(remoteFileDescs);
+        return Lists.newArrayList(remoteFileInfo);
+    }
+
+    /** Generates hybrid splits; on a failed filter pushdown it clears {@code lakePredicates} and scans unfiltered. */
+    private List<SourceSplitBase> generateSplits(FlussTable flussTable, TablePath identifier,
+                                                 List<Predicate> lakePredicates,
+                                                 Set<String> selectedQualifiedPartitionNames, String tracePrefix) {
         OffsetsInitializer.BucketOffsetsRetriever bucketOffsetsRetriever =
                 traceBucketOffsets(new BucketOffsetsRetrieverImpl(admin, identifier), tracePrefix);
         LakeSource<LakeSplit> lakeSource;
@@ -336,25 +406,20 @@ public class FlussMetadata implements ConnectorMetadata {
             lakeSource = traceLakePlanning(createLakeSource(
                     flussTable.getTableInfo().getTablePath(), flussTable.buildRuntimeConf().toMap()), tracePrefix);
         }
-        try (Timer ignored = Tracers.watchScope(EXTERNAL, tracePrefix + "pushDownLakePredicates")) {
-            lakePredicates = convertLakePredicates(flussTable, params.getPredicate());
-            if (!lakePredicates.isEmpty()) {
+        if (!lakePredicates.isEmpty()) {
+            try (Timer ignored = Tracers.watchScope(EXTERNAL, tracePrefix + "pushDownLakePredicates")) {
                 lakeSource.withFilters(lakePredicates);
+            } catch (Exception e) {
+                LOG.warn("Failed to push down predicates to lake source for table {}, " +
+                        "falling back to scan without filter pushdown", identifier, e);
+                lakePredicates.clear();
             }
-        } catch (Exception e) {
-            LOG.warn("Failed to push down predicates to lake source for table {}, " +
-                    "falling back to scan without filter pushdown", identifier, e);
-            lakePredicates = Lists.newArrayList();
         }
 
         Supplier<Set<org.apache.fluss.metadata.PartitionInfo>> listPartitionSupplier;
         if (flussTable.isUnPartitioned()) {
             listPartitionSupplier = LinkedHashSet::new;
         } else {
-            Set<String> selectedQualifiedPartitionNames = selectedPartitionKeys.stream()
-                    .filter(Objects::nonNull)
-                    .map(partitionKey -> toHivePartitionName(flussTable.getPartitionColumnNames(), partitionKey))
-                    .collect(Collectors.toCollection(LinkedHashSet::new));
             Map<String, org.apache.fluss.metadata.PartitionInfo> allPartitions =
                     flussPartitionInfos.computeIfAbsent(identifier, ignored -> loadPartitionInfo(
                             flussTable.getCatalogDBName(), flussTable.getCatalogTableName()));
@@ -364,11 +429,12 @@ public class FlussMetadata implements ConnectorMetadata {
                     .collect(Collectors.toCollection(LinkedHashSet::new));
             listPartitionSupplier = () -> selectedPartitions;
         }
-        List<SourceSplitBase> splits = new ArrayList<>();
+        TableInfo tableInfo = flussTable.getTableInfo();
         LakeSplitGenerator lakeSplitGenerator = new LakeSplitGenerator(
                 tableInfo, admin,
                 lakeSource, bucketOffsetsRetriever,
                 new LatestOffsetsInitializer(), tableInfo.getNumBuckets(), listPartitionSupplier);
+        List<SourceSplitBase> splits;
         try (Timer ignored = Tracers.watchScope(EXTERNAL, tracePrefix + "generateHybridLakeFlussSplits")) {
             splits = lakeSplitGenerator.generateHybridLakeFlussSplits();
         } catch (Exception e) {
@@ -383,20 +449,29 @@ public class FlussMetadata implements ConnectorMetadata {
             throw new StarRocksConnectorException("No readable Fluss lake snapshot exists for table %s.%s.%s",
                     catalogName, flussTable.getCatalogDBName(), flussTable.getCatalogTableName());
         }
-        if (flussTable.getTableNameSuffix().equals(LAKE_TABLE_SUFFIX)) {
-            splits = splits.stream().filter(SourceSplitBase::isLakeSplit)
-                    .collect(Collectors.toList());
-        }
-        if (flussTable.getTableNameSuffix().equals(RT_TABLE_SUFFIX)) {
-            splits = splits.stream().filter(sp -> sp instanceof LogSplit)
-                    .collect(Collectors.toList());
-        }
+        return splits;
+    }
 
-        FlussSplitsInfo flussSplitsInfo = new FlussSplitsInfo(lakePredicates, splits);
-        List<RemoteFileDesc> remoteFileDescs = ImmutableList.of(
-                FlussRemoteFileDesc.createFlussRemoteFileDesc(flussSplitsInfo));
-        remoteFileInfo.setFiles(remoteFileDescs);
-        return Lists.newArrayList(remoteFileInfo);
+    private List<SourceSplitBase> pruneBuckets(FlussTable flussTable, List<Predicate> lakePredicates,
+                                               List<SourceSplitBase> splits, boolean shadowMode) {
+        String traceName = "Fluss.scan." + flussTable.getCatalogTableName() + ".bucketPruning";
+        Optional<Set<Integer>> buckets = FlussBucketPruner.candidateBuckets(flussTable.getTableInfo(), lakePredicates);
+        if (!buckets.isPresent()) {
+            Tracers.record(EXTERNAL, traceName, "NOT_APPLICABLE");
+            return splits;
+        }
+        List<SourceSplitBase> kept = splits.stream()
+                .filter(split -> buckets.get().contains(split.getTableBucket().getBucket()))
+                .collect(Collectors.toList());
+        String decision = String.format("%s kept=%d/%d buckets=%s",
+                shadowMode ? "SHADOW" : "ON", kept.size(), splits.size(), buckets.get());
+        Tracers.record(EXTERNAL, traceName, decision);
+        if (shadowMode) {
+            LOG.info("Fluss bucket pruning for {}.{}.{}: {}",
+                    catalogName, flussTable.getCatalogDBName(), flussTable.getCatalogTableName(), decision);
+            return splits;
+        }
+        return kept;
     }
 
     private List<Predicate> convertLakePredicates(FlussTable flussTable, ScalarOperator predicate) {

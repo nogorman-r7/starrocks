@@ -644,6 +644,20 @@ FROM test;
 * 默认值：true
 * 引入版本：-
 
+### enable_fluss_bucket_pruning
+
+* 描述：是否将 Fluss 表扫描的 Split 裁剪到可能包含匹配行的 Bucket。仅当查询对非分区 Fluss 表的每个分桶键列都有等值或 `IN` 过滤条件时生效。裁剪的行为由 `fluss_bucket_pruning_shadow_mode` 控制：在影子模式下，仅在查询 Profile（`Fluss.scan.<table>.bucketPruning`）和 FE 日志中记录裁剪决策，仍会扫描所有 Split。
+* 默认值：false
+* 类型：Boolean
+* 引入版本：-
+
+### enable_fluss_split_plan_cache
+
+* 描述：是否在同一 FE 上，对表、分区和下推过滤条件相同的 Fluss 表扫描复用已生成的 Split。复用的计划保留其生成时的日志 Offset 和 Lake 文件，因此在缓存条目超过 `fluss_split_plan_cache_ttl_ms` 之前，生成之后写入的行不可见。命中与未命中会记录在查询 Profile（`Fluss.scan.<table>.splitPlanCache`）中。
+* 默认值：false
+* 类型：Boolean
+* 引入版本：-
+
 ### enable_force_rule_based_mv_rewrite
 
 * 描述：在优化器的 RBO（rule-based optimization）阶段是否针对多表查询启用查询改写。启用此功能将提高查询改写的鲁棒性。但如果查询未命中物化视图，则会增加优化耗时。
@@ -1101,6 +1115,21 @@ FROM test;
 * 描述：用于兼容 MySQL 客户端。无实际作用。
 * 默认值：OFF
 * 类型：String
+
+### fluss_bucket_pruning_shadow_mode
+
+* 描述：当 `enable_fluss_bucket_pruning` 为 `true` 时，Bucket 裁剪是否仅记录决策而不实际生效。设置为 `false` 时只扫描裁剪后的 Bucket。
+* 默认值：true
+* 类型：Boolean
+* 引入版本：-
+
+### fluss_split_plan_cache_ttl_ms
+
+* 描述：当 `enable_fluss_split_plan_cache` 为 `true` 时，缓存的 Fluss Split 计划可被复用的时长，决定了查询结果最多可能滞后多久。`0` 表示不复用。超过 300000（5 分钟）的值按 300000 处理。
+* 默认值：5000
+* 单位：毫秒
+* 类型：Long
+* 引入版本：-
 
 ### forward_to_leader
 

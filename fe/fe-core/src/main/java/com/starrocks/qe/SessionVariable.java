@@ -850,6 +850,10 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
     public static final String HUDI_MOR_FORCE_JNI_READER = "hudi_mor_force_jni_reader";
     public static final String PAIMON_FORCE_JNI_READER = "paimon_force_jni_reader";
     public static final String PAIMON_READER_MODE = "paimon_reader_mode";
+    public static final String ENABLE_FLUSS_SPLIT_PLAN_CACHE = "enable_fluss_split_plan_cache";
+    public static final String FLUSS_SPLIT_PLAN_CACHE_TTL_MS = "fluss_split_plan_cache_ttl_ms";
+    public static final String ENABLE_FLUSS_BUCKET_PRUNING = "enable_fluss_bucket_pruning";
+    public static final String FLUSS_BUCKET_PRUNING_SHADOW_MODE = "fluss_bucket_pruning_shadow_mode";
     public static final String AVRO_USE_JNI_READER = "avro_use_jni_reader";
     public static final String ENABLE_DYNAMIC_PRUNE_SCAN_RANGE = "enable_dynamic_prune_scan_range";
     public static final String IO_TASKS_PER_SCAN_OPERATOR = "io_tasks_per_scan_operator";
@@ -3082,6 +3086,19 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
     @VariableMgr.VarAttr(name = PAIMON_READER_MODE)
     private String paimonReaderMode = PaimonReaderMode.AUTO.name();
 
+    @VariableMgr.VarAttr(name = ENABLE_FLUSS_SPLIT_PLAN_CACHE)
+    private boolean enableFlussSplitPlanCache = false;
+
+    @VariableMgr.VarAttr(name = FLUSS_SPLIT_PLAN_CACHE_TTL_MS)
+    private long flussSplitPlanCacheTtlMs = 5000;
+
+    @VariableMgr.VarAttr(name = ENABLE_FLUSS_BUCKET_PRUNING)
+    private boolean enableFlussBucketPruning = false;
+
+    // While true, pruning is computed and traced but every split is still scanned.
+    @VariableMgr.VarAttr(name = FLUSS_BUCKET_PRUNING_SHADOW_MODE)
+    private boolean flussBucketPruningShadowMode = true;
+
     @VariableMgr.VarAttr(name = AVRO_USE_JNI_READER)
     private boolean avroUseJNIReader = false;
 
@@ -4014,6 +4031,38 @@ public class SessionVariable implements Serializable, Writable, Cloneable {
 
     public void setPaimonReaderMode(String paimonReaderMode) {
         this.paimonReaderMode = paimonReaderMode.toUpperCase(Locale.ROOT);
+    }
+
+    public boolean isEnableFlussSplitPlanCache() {
+        return enableFlussSplitPlanCache;
+    }
+
+    public void setEnableFlussSplitPlanCache(boolean enableFlussSplitPlanCache) {
+        this.enableFlussSplitPlanCache = enableFlussSplitPlanCache;
+    }
+
+    public long getFlussSplitPlanCacheTtlMs() {
+        return flussSplitPlanCacheTtlMs;
+    }
+
+    public void setFlussSplitPlanCacheTtlMs(long flussSplitPlanCacheTtlMs) {
+        this.flussSplitPlanCacheTtlMs = flussSplitPlanCacheTtlMs;
+    }
+
+    public boolean isEnableFlussBucketPruning() {
+        return enableFlussBucketPruning;
+    }
+
+    public void setEnableFlussBucketPruning(boolean enableFlussBucketPruning) {
+        this.enableFlussBucketPruning = enableFlussBucketPruning;
+    }
+
+    public boolean isFlussBucketPruningShadowMode() {
+        return flussBucketPruningShadowMode;
+    }
+
+    public void setFlussBucketPruningShadowMode(boolean flussBucketPruningShadowMode) {
+        this.flussBucketPruningShadowMode = flussBucketPruningShadowMode;
     }
 
     public boolean getAvroUseJNIReader() {

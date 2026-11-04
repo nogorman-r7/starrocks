@@ -37,6 +37,7 @@ public class FlussConnector implements Connector {
     private final String catalogName;
     private final Configuration flussClientConf;
     private final Configuration catalogConf;
+    private final FlussSplitPlanCache splitPlanCache = new FlussSplitPlanCache();
     private Connection connection;
     private Admin admin;
 
@@ -71,7 +72,7 @@ public class FlussConnector implements Connector {
     @Override
     public synchronized ConnectorMetadata getMetadata() {
         initConnection();
-        return new FlussMetadata(catalogName, hdfsEnvironment, this.admin, catalogConf);
+        return new FlussMetadata(catalogName, hdfsEnvironment, this.admin, catalogConf, splitPlanCache);
     }
 
     private void initConnection() {

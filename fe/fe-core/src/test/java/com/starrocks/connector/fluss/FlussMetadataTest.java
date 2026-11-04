@@ -27,6 +27,11 @@ import com.starrocks.connector.RemoteFileDesc;
 import com.starrocks.connector.RemoteFileInfo;
 import com.starrocks.connector.exception.StarRocksConnectorException;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.qe.SessionVariable;
+import com.starrocks.sql.ast.expression.BinaryType;
+import com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator;
+import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
+import com.starrocks.sql.optimizer.operator.scalar.ConstantOperator;
 import com.starrocks.sql.optimizer.statistics.Statistics;
 import com.starrocks.type.IntegerType;
 import com.starrocks.type.TypeFactory;
@@ -40,27 +45,37 @@ import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.DatabaseNotExistException;
 import org.apache.fluss.exception.LakeTableSnapshotNotExistException;
 import org.apache.fluss.exception.TableNotPartitionedException;
+import org.apache.fluss.flink.lake.LakeSplitGenerator;
+import org.apache.fluss.flink.source.split.LogSplit;
 import org.apache.fluss.flink.source.split.SourceSplitBase;
 import org.apache.fluss.flink.utils.LakeSourceUtils;
+import org.apache.fluss.lake.serializer.SimpleVersionedSerializer;
 import org.apache.fluss.lake.source.LakeSource;
 import org.apache.fluss.lake.source.LakeSplit;
+import org.apache.fluss.lake.source.Planner;
+import org.apache.fluss.lake.source.RecordReader;
 import org.apache.fluss.metadata.PartitionInfo;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
 import org.apache.fluss.metadata.Schema;
+import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.metadata.TableStats;
+import org.apache.fluss.predicate.PredicateBuilder;
 import org.apache.fluss.types.DataTypes;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 public class FlussMetadataTest {
     private static final String CATALOG = "fluss0";
@@ -261,11 +276,110 @@ public class FlussMetadataTest {
                     () -> metadata.getRemoteFiles(table, GetRemoteFilesParams.newBuilder().build()));
             String timers = Tracers.printScopeTimer();
             Assertions.assertTrue(timers.contains(TABLE + ".createLakeSource"), timers);
-            Assertions.assertTrue(timers.contains(TABLE + ".pushDownLakePredicates"), timers);
+            Assertions.assertTrue(timers.contains(TABLE + ".convertLakePredicates"), timers);
             Assertions.assertTrue(timers.contains(TABLE + ".generateHybridLakeFlussSplits"), timers);
         } finally {
             Tracers.close();
         }
+    }
+
+    @Test
+    public void testBucketPruningIsOffByDefault() {
+        List<SourceSplitBase> generated = mockSplitGeneration(new AtomicInteger());
+        withSession(sv -> { }, () -> {
+            Assertions.assertEquals(generated, getFlussSplits(pkTable(), idEquals(7)));
+            Assertions.assertFalse(Tracers.printVars().contains("bucketPruning"));
+        });
+    }
+
+    @Test
+    public void testBucketPruningShadowModeScansEverySplit() {
+        List<SourceSplitBase> generated = mockSplitGeneration(new AtomicInteger());
+        withSession(sv -> sv.setEnableFlussBucketPruning(true), () -> {
+            Assertions.assertEquals(generated, getFlussSplits(pkTable(), idEquals(7)));
+            String vars = Tracers.printVars();
+            Assertions.assertTrue(vars.contains("SHADOW kept=1/3 buckets=[" + bucketOfId(7) + "]"), vars);
+        });
+    }
+
+    @Test
+    public void testBucketPruningKeepsOnlyMatchingBucket() {
+        mockSplitGeneration(new AtomicInteger());
+        withSession(sv -> {
+            sv.setEnableFlussBucketPruning(true);
+            sv.setFlussBucketPruningShadowMode(false);
+        }, () -> {
+            List<SourceSplitBase> splits = getFlussSplits(pkTable(), idEquals(7));
+            Assertions.assertEquals(1, splits.size());
+            Assertions.assertEquals(bucketOfId(7), splits.get(0).getTableBucket().getBucket());
+        });
+    }
+
+    @Test
+    public void testBucketPruningNotApplicableKeepsEverySplit() {
+        List<SourceSplitBase> generated = mockSplitGeneration(new AtomicInteger());
+        withSession(sv -> {
+            sv.setEnableFlussBucketPruning(true);
+            sv.setFlussBucketPruningShadowMode(false);
+        }, () -> {
+            Assertions.assertEquals(generated, getFlussSplits(pkTable(), GetRemoteFilesParams.newBuilder().build()));
+            Assertions.assertTrue(Tracers.printVars().contains("NOT_APPLICABLE"));
+        });
+    }
+
+    @Test
+    public void testSplitPlanCacheIsOffByDefault() {
+        AtomicInteger generations = new AtomicInteger();
+        mockSplitGeneration(generations);
+        withSession(sv -> { }, () -> {
+            getFlussSplits(pkTable(), idEquals(7));
+            getFlussSplits(pkTable(), idEquals(7));
+        });
+        Assertions.assertEquals(2, generations.get());
+    }
+
+    @Test
+    public void testSplitPlanCacheReusesSplitsForSameKey() {
+        AtomicInteger generations = new AtomicInteger();
+        List<SourceSplitBase> generated = mockSplitGeneration(generations);
+        withSession(sv -> sv.setEnableFlussSplitPlanCache(true), () -> {
+            Assertions.assertEquals(generated, getFlussSplits(pkTable(), idEquals(7)));
+            Assertions.assertTrue(Tracers.printVars().contains("MISS"));
+            Assertions.assertEquals(generated, getFlussSplits(pkTable(), idEquals(7)));
+            Assertions.assertTrue(Tracers.printVars().contains("HIT"));
+            getFlussSplits(pkTable(), idEquals(8));
+        });
+        Assertions.assertEquals(2, generations.get());
+    }
+
+    @Test
+    public void testSplitPlanCacheWithZeroTtlIsDisabled() {
+        AtomicInteger generations = new AtomicInteger();
+        mockSplitGeneration(generations);
+        withSession(sv -> {
+            sv.setEnableFlussSplitPlanCache(true);
+            sv.setFlussSplitPlanCacheTtlMs(0);
+        }, () -> {
+            getFlussSplits(pkTable(), idEquals(7));
+            getFlussSplits(pkTable(), idEquals(7));
+        });
+        Assertions.assertEquals(2, generations.get());
+    }
+
+    @Test
+    public void testSplitPlanCacheFeedsBucketPruning() {
+        AtomicInteger generations = new AtomicInteger();
+        mockSplitGeneration(generations);
+        withSession(sv -> {
+            sv.setEnableFlussSplitPlanCache(true);
+            sv.setEnableFlussBucketPruning(true);
+            sv.setFlussBucketPruningShadowMode(false);
+        }, () -> {
+            Assertions.assertEquals(1, getFlussSplits(pkTable(), idEquals(7)).size());
+            Assertions.assertEquals(1, getFlussSplits(pkTable(), idEquals(7)).size());
+            Assertions.assertEquals(3, getFlussSplits(pkTable(), GetRemoteFilesParams.newBuilder().build()).size());
+        });
+        Assertions.assertEquals(2, generations.get());
     }
 
     @Test
@@ -305,6 +419,94 @@ public class FlussMetadataTest {
                     Collections.emptyList(), null, -1, TvrTableSnapshot.empty());
             Assertions.assertEquals(
                     (double) Config.default_statistics_output_row_count, statistics.getOutputRowCount());
+        }
+    }
+
+    /** Splits for every bucket of {@link #pkTable()}; the generator call count goes to {@code generations}. */
+    private List<SourceSplitBase> mockSplitGeneration(AtomicInteger generations) {
+        List<SourceSplitBase> splits = new ArrayList<>();
+        for (int bucket = 0; bucket < 3; bucket++) {
+            splits.add(new LogSplit(new TableBucket(TABLE_ID, bucket), null, 0L, 10L));
+        }
+        new MockUp<LakeSourceUtils>() {
+            @Mock
+            public static LakeSource<LakeSplit> createLakeSource(TablePath tablePath, Map<String, String> options) {
+                return new NoopLakeSource();
+            }
+        };
+        new MockUp<LakeSplitGenerator>() {
+            @Mock
+            public List<SourceSplitBase> generateHybridLakeFlussSplits() {
+                generations.incrementAndGet();
+                return new ArrayList<>(splits);
+            }
+        };
+        return splits;
+    }
+
+    private static void withSession(Consumer<SessionVariable> configure, Runnable body) {
+        ConnectContext context = new ConnectContext();
+        configure.accept(context.getSessionVariable());
+        context.setThreadLocalInfo();
+        Tracers.register();
+        Tracers.init(Tracers.Mode.TIMING, Tracers.Module.EXTERNAL, true, false);
+        try {
+            body.run();
+        } finally {
+            Tracers.close();
+            ConnectContext.remove();
+        }
+    }
+
+    private static FlussTable pkTable() {
+        return flussTable(tableInfo(false, true), "");
+    }
+
+    private static GetRemoteFilesParams idEquals(int id) {
+        return GetRemoteFilesParams.newBuilder()
+                .setPredicate(new BinaryPredicateOperator(BinaryType.EQ,
+                        new ColumnRefOperator(0, IntegerType.INT, "id", true, false), ConstantOperator.createInt(id)))
+                .build();
+    }
+
+    private static int bucketOfId(int id) {
+        TableInfo tableInfo = tableInfo(false, true);
+        return FlussBucketPruner.candidateBuckets(tableInfo,
+                List.of(new PredicateBuilder(tableInfo.getRowType()).equal(0, id))).orElseThrow().iterator().next();
+    }
+
+    private static final class NoopLakeSource implements LakeSource<LakeSplit> {
+        @Override
+        public void withProject(int[][] project) {
+        }
+
+        @Override
+        public void withLimit(int limit) {
+        }
+
+        @Override
+        public FilterPushDownResult withFilters(List<org.apache.fluss.predicate.Predicate> predicates) {
+            return null;
+        }
+
+        @Override
+        public Planner<LakeSplit> createPlanner(PlannerContext context) {
+            return Collections::emptyList;
+        }
+
+        @Override
+        public RecordReader createRecordReader(ReaderContext<LakeSplit> context) {
+            return null;
+        }
+
+        @Override
+        public SimpleVersionedSerializer<LakeSplit> getSplitSerializer() {
+            return null;
+        }
+
+        @Override
+        public LakeSource<LakeSplit> copy() {
+            return this;
         }
     }
 

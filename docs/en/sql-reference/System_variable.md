@@ -754,6 +754,20 @@ Used for MySQL client compatibility. No practical usage.
 * **Data Type**: boolean
 * **Introduced in**: v3.2.0
 
+### enable_fluss_bucket_pruning
+
+* **Description**: Whether to prune the splits of a Fluss table scan to the buckets that can hold matching rows. It applies when the query has equality or `IN` filters on every bucket-key column of a non-partitioned Fluss table. What pruning does is controlled by `fluss_bucket_pruning_shadow_mode`: in shadow mode the decision is only recorded in the query profile (`Fluss.scan.<table>.bucketPruning`) and the FE log, and every split is still scanned.
+* **Default**: false
+* **Data type**: Boolean
+* **Introduced in**: -
+
+### enable_fluss_split_plan_cache
+
+* **Description**: Whether to reuse the splits generated for a Fluss table scan across queries with the same table, partitions and pushed-down filters on the same FE. A reused plan keeps the log offsets and lake files it was generated with, so rows written after it was generated are not visible until the entry is older than `fluss_split_plan_cache_ttl_ms`. Hits and misses are recorded in the query profile (`Fluss.scan.<table>.splitPlanCache`).
+* **Default**: false
+* **Data type**: Boolean
+* **Introduced in**: -
+
 ### enable_force_rule_based_mv_rewrite
 
 * **Description**: Whether to enable query rewrite for queries against multiple tables in the optimizer's rule-based optimization phase. Enabling this feature will improve the robustness of the query rewrite. However, it will also increase the time consumption if the query misses the materialized view.
@@ -1307,6 +1321,21 @@ The following variables tune the back-pressure behavior and only take effect whe
 ### event_scheduler
 
 Used for MySQL client compatibility. No practical usage.
+
+### fluss_bucket_pruning_shadow_mode
+
+* **Description**: When `enable_fluss_bucket_pruning` is `true`, whether bucket pruning only records its decision instead of applying it. Set it to `false` to scan only the pruned buckets.
+* **Default**: true
+* **Data type**: Boolean
+* **Introduced in**: -
+
+### fluss_split_plan_cache_ttl_ms
+
+* **Description**: How long a cached Fluss split plan is reused when `enable_fluss_split_plan_cache` is `true`. It bounds how stale a query result can be. `0` disables reuse. Values above 300000 (5 minutes) are capped at 300000.
+* **Default**: 5000
+* **Unit**: ms
+* **Data type**: Long
+* **Introduced in**: -
 
 ### force_schedule_local (Session)
 
