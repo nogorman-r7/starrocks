@@ -616,6 +616,12 @@ FROM test;
 - 默认值：true
 - 引入版本：v3.5.1
 
+### enable_delta_lake_function_predicate_pruning
+
+* 描述：对 Delta Lake 表列取函数后的谓词，是否用于跳过数据文件。StarRocks 会把这类谓词转换为该列本身的条件，例如把 `year(dt) = 2024` 转换为 `dt >= '2024-01-01' AND dt < '2025-01-01'`，从而通过分区值和文件列统计信息跳过文件，并通过 Parquet row group 的列统计信息跳过 row group。适用的函数与 `enable_iceberg_function_predicate_pruning` 相同。原谓词仍会对数据行求值。设置为 `false` 时按原方式规划这类查询，例如用于对比结果。
+* 默认值：true
+* 引入版本：v26.3
+
 ### enable_distinct_agg_over_window
 
 * **描述**: 控制优化器重写，将带有 WINDOW 子句的 DISTINCT 聚合调用转换为等价的基于 join 的计划。启用时（`true`，默认值），QueryOptimizer.invoke convertDistinctAggOverWindowToNullSafeEqualJoin 将会：
@@ -685,9 +691,21 @@ FROM test;
 * 默认值：false，表示不开启。
 * 引入版本：v3.1.4
 
+### enable_hive_function_predicate_pruning
+
+* 描述：对 Hive 表日期或日期时间列取函数后的谓词，是否用于裁剪分区。StarRocks 会把这类谓词转换为该列本身的条件，例如把 `year(dt) = 2024` 转换为 `dt >= '2024-01-01' AND dt < '2025-01-01'`，从而在分区列上裁剪分区，并通过 row group 的列统计信息跳过 row group。适用于 `enable_iceberg_function_predicate_pruning` 中列出的日期和时间函数。原谓词仍会对数据行求值。设置为 `false` 时按原方式规划这类查询，例如用于对比结果。
+* 默认值：true
+* 引入版本：v26.3
+
 ### enable_iceberg_eq_delete_runtime_filter_pruning
 
 * 描述：是否允许 Runtime Filter 跳过 Iceberg 表的 Equality Delete 文件。仅当表从未变更过分区规格（Partition Spec），且每个分区字段都是查询所读取的 INT、DATE 或 STRING 列的 identity 转换时生效。此时，Join 在这些列上生成的 Runtime Filter 会跳过被其过滤掉的分区的 Equality Delete 文件。设置为 `false` 时会应用所有 Equality Delete 文件，例如查询报错且错误信息中提到该变量时。
+* 默认值：true
+* 引入版本：v26.2
+
+### enable_iceberg_function_predicate_pruning
+
+* 描述：对 Iceberg 表列取函数后的谓词，是否用于跳过数据文件。StarRocks 会把这类谓词转换为该列本身的条件，例如把 `year(dt) = 2024` 转换为 `dt >= '2024-01-01' AND dt < '2025-01-01'`，从而通过该列的任意分区转换（`year`、`month`、`day`、`hour`、`truncate`）以及文件列统计信息跳过文件。适用于 `year()`、`to_date()`、`date()`、`date_trunc()`、使用 `'%Y-%m'` 等补零格式的 `date_format()`、`datediff()`、`weeks_add()`/`hours_add()`/`minutes_add()`/`seconds_add()` 及对应的 `_sub` 形式、`year() = ... AND month()/quarter() = ...`、做等值比较的 `left()`/`substr(s, 1, n)`，以及 `starts_with()`。原谓词仍会对数据行求值。设置为 `false` 时按原方式规划这类查询，例如用于对比结果。
 * 默认值：true
 * 引入版本：v26.2
 
@@ -701,7 +719,7 @@ FROM test;
 
 ### enable_insert_partial_update
 
-* **描述**：是否为主键表的 INSERT 语句启用部分更新（Partial Update）。当设置为 `true`（默认）时，如果 INSERT 语句只指定了部分列（少于表中所有非生成列），系统会执行部分更新，即仅更新指定列，并保留其他列的现有值。当设置为 `false` 时，系统会对未指定的列使用默认值，而不是保留已有值。此功能特别适用于对主键表的特定列进行更新，而不影响其他列的值。如果目标分区从未有任何事务提交过数据，就不存在需要保留的已有值，此时 INSERT 会作为普通插入执行，未指定的列填充默认值，跳过部分更新的处理。这只在未指定的列都能这样填充（可为空或有默认值，且不是 AUTO_INCREMENT 列）时生效，INSERT OVERWRITE 和显式事务（`BEGIN ... COMMIT`）内的 INSERT 不适用，仍按部分更新执行。如果有其他写入抢先提交到了这些分区，该 INSERT 会失败并提示重试，重试时会按部分更新执行。
+* **描述**：是否为主键表的 INSERT 语句启用部分更新（Partial Update）。当设置为 `true`（默认）时，如果 INSERT 语句只指定了部分列（少于表中所有非生成列），系统会执行部分更新，即仅更新指定列，并保留其他列的现有值。当设置为 `false` 时，系统会对未指定的列使用默认值，而不是保留已有值。此功能特别适用于对主键表的特定列进行更新，而不影响其他列的值。如果目标分区从未有任何事务提交过数据，就不存在需要保留的已有值，此时 INSERT 会作为普通插入执行，未指定的列填充默认值，跳过部分更新的处理。这只在未指定的列都能这样填充（可为空或有默认值，且不是 AUTO_INCREMENT 列）时生效，INSERT OVERWRITE 和显式事务（`BEGIN ... COMMIT`）内的 INSERT 不适用，仍按部分更新执行。如果有其他写入抢先提交到了这些分区，该 INSERT 会自动重新规划并按部分更新再执行一次。
 * **默认值**：true
 * **引入版本**：v3.3.20、v3.4.9、v3.5.8、v4.0.2
 

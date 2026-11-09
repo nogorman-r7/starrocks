@@ -41,6 +41,8 @@ import com.starrocks.connector.iceberg.procedure.RemoveOrphanFilesProcedure;
 import com.starrocks.connector.iceberg.procedure.RewriteDataFilesProcedure;
 import com.starrocks.connector.iceberg.procedure.RewriteManifestsProcedure;
 import com.starrocks.connector.iceberg.procedure.RollbackToSnapshotProcedure;
+import com.starrocks.connector.iceberg.procedure.RollbackToTimestampProcedure;
+import com.starrocks.connector.iceberg.procedure.SetCurrentSnapshotProcedure;
 import com.starrocks.persist.ColumnIdExpr;
 import com.starrocks.planner.DescriptorTable;
 import com.starrocks.planner.expression.ExprToThrift;
@@ -410,7 +412,11 @@ public class IcebergTable extends Table {
             if (!bucketPropertySupported(column.getType())) {
                 continue;
             }
-            bucketProperties.add(new BucketProperty(TBucketFunction.MURMUR3_X86_32, bucket.second, column));
+            // Iceberg buckets a uuid by its 16 bytes, but StarRocks reads it as a 36-char string, so the BE
+            // must parse the string back to bytes before hashing when it shuffles the other side.
+            TBucketFunction func = schema.findField(bucket.first).type() instanceof Types.UUIDType
+                    ? TBucketFunction.MURMUR3_X86_32_UUID : TBucketFunction.MURMUR3_X86_32;
+            bucketProperties.add(new BucketProperty(func, bucket.second, column));
         }
 
         return bucketProperties;
@@ -795,6 +801,8 @@ public class IcebergTable extends Table {
             case EXPIRE_SNAPSHOTS -> ExpireSnapshotsProcedure.getInstance();
             case REMOVE_ORPHAN_FILES -> RemoveOrphanFilesProcedure.getInstance();
             case ROLLBACK_TO_SNAPSHOT -> RollbackToSnapshotProcedure.getInstance();
+            case ROLLBACK_TO_TIMESTAMP -> RollbackToTimestampProcedure.getInstance();
+            case SET_CURRENT_SNAPSHOT -> SetCurrentSnapshotProcedure.getInstance();
             case REWRITE_DATA_FILES -> RewriteDataFilesProcedure.getInstance();
             case REWRITE_MANIFESTS -> RewriteManifestsProcedure.getInstance();
             case ADD_FILES -> AddFilesProcedure.getInstance();
